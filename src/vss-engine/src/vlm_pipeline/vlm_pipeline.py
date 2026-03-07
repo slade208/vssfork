@@ -299,16 +299,16 @@ class DecoderProcess(ViaProcessBase):
         chunk = ChunkInfo()
         chunk.file = "/opt/nvidia/via/warmup_streams/its_264.mp4"
         chunk.end_pts = 5000000000
+        frames = []
+        frame_times = []
+        audio_frames = []
+        error = None
         if os.path.exists(chunk.file):
             for fgetter in self._fgetters:
                 frames, frame_times, audio_frames, error = fgetter.get_frames(chunk, True)
 
         chunk.file = "/opt/nvidia/via/warmup_streams/its_265.mp4"
         if os.path.exists(chunk.file):
-            frames = []
-            frame_times = []
-            audio_frames = []
-            error = None
             for fgetter in self._fgetters:
                 frames, frame_times, audio_frames, error = fgetter.get_frames(chunk, True)
 

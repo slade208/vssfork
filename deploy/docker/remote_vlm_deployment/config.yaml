@@ -25,14 +25,15 @@ tools:
       port: !ENV ${GRAPH_DB_BOLT_PORT}
       username: !ENV ${GRAPH_DB_USERNAME}
       password: !ENV ${GRAPH_DB_PASSWORD}
+      embedding_parallel_count: 1
     tools:
       embedding: nvidia_embedding
 
   vector_db:
     type: milvus
     params:
-      host: !ENV ${MILVUS_DB_HOST}
-      port: !ENV ${MILVUS_DB_GRPC_PORT}
+      host: milvus-standalone
+      port: "19530"
     tools:
       embedding: nvidia_embedding
 
@@ -41,7 +42,7 @@ tools:
     params:
       model: meta/llama-3.1-70b-instruct
       base_url: https://integrate.api.nvidia.com/v1
-      max_tokens: 2048
+      max_tokens: 1024 # was 2048
       temperature: 0.2
       top_p: 0.7
       api_key: !ENV ${NVIDIA_API_KEY}
@@ -51,7 +52,7 @@ tools:
     params:
       model: meta/llama-3.1-70b-instruct
       base_url: https://integrate.api.nvidia.com/v1
-      max_tokens: 2048
+      max_tokens: 1024 # was 2048
       temperature: 0.2
       top_p: 0.7
       api_key: !ENV ${NVIDIA_API_KEY}
@@ -61,7 +62,7 @@ tools:
     params:
       model: meta/llama-3.1-70b-instruct
       base_url: https://integrate.api.nvidia.com/v1
-      max_tokens: 2048
+      max_tokens: 1024 # was 2048
       temperature: 0.2
       top_p: 0.7
       api_key: !ENV ${NVIDIA_API_KEY}
@@ -89,8 +90,8 @@ functions:
   summarization:
     type: batch_summarization
     params:
-      batch_size: 6
-      batch_max_concurrency: 20
+      batch_size: 1 # was 6
+      batch_max_concurrency: 2 # was 20
       prompts:
         caption: "Write a concise and clear dense caption for the provided warehouse video, focusing on irregular or hazardous events such as boxes falling, workers not wearing PPE, workers falling, workers taking photographs, workers chitchatting, forklift stuck, etc. Start and end each sentence with a time stamp."
         caption_summarization: "You should summarize the following events of a warehouse in the format start_time:end_time:caption. For start_time and end_time use . to seperate seconds, minutes, hours. If during a time segment only regular activities happen, then ignore them, else note any irregular activities in detail. The output should be bullet points in the format start_time:end_time: detailed_event_description. Don't return anything else except the bullet points."
@@ -106,6 +107,7 @@ functions:
       image: false
       cot: false
       top_k: 5
+      embedding_parallel_count: 1
       #disable_entity_extraction: True  # uncomment this line for DGX Spark
     tools:
       llm: chat_llm

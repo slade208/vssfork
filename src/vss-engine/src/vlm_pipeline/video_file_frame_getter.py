@@ -209,6 +209,20 @@ class DefaultFrameSelector:
         return False
 
 
+class AllFrameSelector(BaseFrameSelector):
+    """Select all frames."""
+
+    def __init__(self):
+        self._selected_pts_array = []
+
+    def set_chunk(self, chunk: ChunkInfo):
+        self._chunk = chunk
+        self._selected_pts_array = []
+
+    def choose_frame(self, buffer, pts: int):
+        return True
+
+
 class AudioChunkIterator:
     """Iterator that yields audio chunks from queue.
 
@@ -450,6 +464,21 @@ class VideoFileFrameGetter:
         self._output_cv_metadata = None
         self._dump_cached_frames = False
         self._last_video_codec = None
+        self._overlay_only = False
+        self._use_osd_pipeline_for_vlm = (
+            os.getenv("VSS_CV_OVERLAY_PIPELINE_FOR_VLM", "false").lower()
+            in ["1", "true", "yes"]
+        )
+        self._overlay_rendered_requests = set()
+        self._overlay_start_wallclock = None
+        self._overlay_debug_count = 0
+        self._overlay_frame_count = 0
+        self._overlay_frame_duration_ns = None
+        self._overlay_expected_frames = None
+        self._overlay_eos_requested = False
+        self._overlay_eos_received = False
+        self._overlay_dump_frames_only = False
+        self._force_dump_frames_only = False
         self._live_stream_chunk_decoded_callback: Callable[
             [
                 ChunkInfo,
@@ -1428,6 +1457,8 @@ class VideoFileFrameGetter:
 
         def add_to_cache(buffer, width, height):
             # Probe callback to add raw frame / jpeg image to cache
+            if self._overlay_only:
+                return
             _, mapinfo = buffer.map(Gst.MapFlags.READ)
             if self._enable_jpeg_output:
                 # Buffer contains JPEG image, add to cache as is
@@ -1539,6 +1570,10 @@ class VideoFileFrameGetter:
 
         def on_new_sample(appsink):
             # Appsink callback to pull frame from the pipeline
+            if self._overlay_only:
+                # Drain samples to keep pipeline moving, but skip caching.
+                appsink.emit("pull-sample")
+                return Gst.FlowReturn.OK
             sample = appsink.emit("pull-sample")
             caps = sample.get_caps()
             height = caps.get_structure(0).get_value("height")
@@ -1771,6 +1806,7 @@ class VideoFileFrameGetter:
             if t == Gst.MessageType.EOS:
                 # sys.stdout.write("End-of-stream\n")
                 logger.debug("EOS received on bus")
+                selff._overlay_eos_received = True
                 selff._audio_stop.set()
                 selff._loop.quit()
             elif t == Gst.MessageType.WARNING:
@@ -1924,7 +1960,11 @@ class VideoFileFrameGetter:
             try:
                 # Casting l_obj.data to pyds.NvDsObjectMeta
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-                obj_meta.text_params.display_text = str(obj_meta.object_id)
+                label = obj_meta.obj_label or ""
+                if label:
+                    obj_meta.text_params.display_text = f"{label} #{obj_meta.object_id}"
+                else:
+                    obj_meta.text_params.display_text = str(obj_meta.object_id)
                 if not self._draw_bbox:
                     obj_meta.rect_params.border_width = 0
 
@@ -1995,6 +2035,25 @@ class VideoFileFrameGetter:
             except StopIteration:
                 break
 
+        # Add a simple legend overlay (class names with IDs) in the top-left.
+        if self._legend_labels:
+            max_items = 6
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            text_params_list = display_meta.text_params
+            legend_lines = ["Legend (class #id):"] + self._legend_labels[:max_items]
+            display_meta.num_labels = len(legend_lines)
+            for i, line in enumerate(legend_lines):
+                txt = text_params_list[i]
+                txt.display_text = line
+                txt.x_offset = 10
+                txt.y_offset = 20 + (i * 20)
+                txt.font_params.font_name = "Serif"
+                txt.font_params.font_size = 18
+                txt.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                txt.set_bg_clr = 1
+                txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.6)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
         try:
             for obj_meta in obj_list:
                 pyds.nvds_add_obj_meta_to_frame(frame_meta, obj_meta, None)
@@ -2023,9 +2082,31 @@ class VideoFileFrameGetter:
             self.input_cv_metadata.read_json_file(cv_metadata_json_file)
         else:
             self.input_cv_metadata = None
+        self._legend_labels = (
+            self.input_cv_metadata.get_obj_labels_list() if self.input_cv_metadata else []
+        )
         self._output_cv_metadata = None
-        # dump cached frames when OSD pipeline is enabled
-        self._dump_cached_frames = True
+        # Configure overlay rendering. Defaults to showing boxes (no filled masks).
+        self._draw_bbox = os.getenv("VSS_CV_OVERLAY_DRAW_BBOX", "true").lower() in [
+            "1",
+            "true",
+            "yes",
+        ]
+        self._fill_mask = os.getenv("VSS_CV_OVERLAY_FILL_MASK", "false").lower() in [
+            "1",
+            "true",
+            "yes",
+        ]
+        self._direct_overlay_video = (
+            os.getenv("VSS_CV_DIRECT_OVERLAY_VIDEO", "true").lower() in ["1", "true", "yes"]
+        )
+        if self._force_dump_frames_only:
+            self._direct_overlay_video = False
+
+        # dump cached frames when OSD pipeline is enabled (disabled if direct overlay video is used)
+        self._dump_cached_frames = not self._direct_overlay_video
+        if self._force_dump_frames_only:
+            self._dump_cached_frames = True
         self._request_id = request_id
         self._cached_frames_dir = f"/tmp/via/cached_frames/{request_id}"
         # Check if the cached frames dump folder exists
@@ -2049,6 +2130,20 @@ class VideoFileFrameGetter:
 
         self._is_live = file_or_rtsp.startswith("rtsp://")
         pipeline = Gst.Pipeline()
+
+        # Ensure nvstreammux receives NVMM buffers by converting right after decode.
+        pre_nvvideoconvert = Gst.ElementFactory.make("nvvideoconvert")
+        pre_nvvideoconvert.set_property("nvbuf-memory-type", 2)
+        pre_nvvideoconvert.set_property("compute-hw", 1)
+        pre_nvvideoconvert.set_property("gpu-id", self._gpu_id)
+        pipeline.add(pre_nvvideoconvert)
+
+        pre_capsfilter = Gst.ElementFactory.make("capsfilter")
+        pre_capsfilter.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"),
+        )
+        pipeline.add(pre_capsfilter)
 
         def cb_elem_added(elem, username, password, selff):
             if "nvv4l2decoder" in elem.get_factory().get_name():
@@ -2093,7 +2188,7 @@ class VideoFileFrameGetter:
             gststruct = caps.get_structure(0)
             gstname = gststruct.get_name()
             if gstname.find("video") != -1:
-                uridecodebin_pad.link(self._tee.get_static_pad("sink"))
+                uridecodebin_pad.link(pre_nvvideoconvert.get_static_pad("sink"))
                 logger.info("Video stream found.")
             if gstname.find("audio") != -1 and self._enable_audio and self._audio_q1:
                 self._audio_present = True
@@ -2141,7 +2236,7 @@ class VideoFileFrameGetter:
                             )
                         else:
                             pipeline.add(self._vdecodebin_h264)
-                            self._vdecodebin_h264.link(self._tee)
+                            self._vdecodebin_h264.link(pre_nvvideoconvert)
                         self._vdecodebin = self._vdecodebin_h264
                     elif gstname.find("h265") != -1:
                         if not self._vdecodebin_h265:
@@ -2157,7 +2252,7 @@ class VideoFileFrameGetter:
                             )
                         else:
                             pipeline.add(self._vdecodebin_h265)
-                            self._vdecodebin_h265.link(self._tee)
+                            self._vdecodebin_h265.link(pre_nvvideoconvert)
                         self._vdecodebin = self._vdecodebin_h265
                     elif not self._vdecodebin:
                         self._vdecodebin = Gst.ElementFactory.make("decodebin")
@@ -2190,12 +2285,14 @@ class VideoFileFrameGetter:
 
         # self._is_live = True
 
-        # Add a tee, queue and fakesink reuired for seeking
-        # decoder -> tee -> queue -> fakesink
-        #               |-> queue -> nvstreammux
+        # Add a tee, queue and fakesink required for seeking
+        # decoder -> nvvideoconvert -> capsfilter(NVMM) -> tee -> queue -> fakesink
+        #                                               |-> queue -> nvstreammux
         self._tee = Gst.ElementFactory.make("tee")
         pipeline.add(self._tee)
         tee_pad = self._tee.get_static_pad("sink")
+        pre_nvvideoconvert.link(pre_capsfilter)
+        pre_capsfilter.link(self._tee)
         queue_tee_fakesink = Gst.ElementFactory.make("queue")
         pipeline.add(queue_tee_fakesink)
         seek_fakesink = Gst.ElementFactory.make("fakesink")
@@ -2393,6 +2490,8 @@ class VideoFileFrameGetter:
                     break
                 l_frame = l_frame.next
             #############################
+            if buffer_pts == 0 and buffer.pts != Gst.CLOCK_TIME_NONE:
+                return buffer.pts
             return buffer_pts
 
         def update_ntp_pts(buffer, ntp_pts):
@@ -2444,6 +2543,11 @@ class VideoFileFrameGetter:
             buffer_pts = get_buffer_pts(buffer)
             # buffer_pts = buffer.pts
             # print (f"Got frame with buffer_pts = :{buffer_pts}")
+            if buffer_pts == Gst.CLOCK_TIME_NONE and self._overlay_only:
+                if self._overlay_frame_duration_ns:
+                    buffer_pts = self._overlay_frame_count * self._overlay_frame_duration_ns
+                else:
+                    buffer_pts = 0
             if buffer_pts == Gst.CLOCK_TIME_NONE:
                 return Gst.PadProbeReturn.DROP
             self._last_frame_pts = buffer_pts
@@ -2545,6 +2649,83 @@ class VideoFileFrameGetter:
                     return Gst.PadProbeReturn.OK
 
             else:
+                if self._overlay_only:
+                    # For overlay-only rendering, allow full decode and force EOS at end.
+                    if self._overlay_start_wallclock is None:
+                        self._overlay_start_wallclock = time.time()
+                    self._overlay_frame_count += 1
+                    if self._overlay_debug_count < 3:
+                        logger.info(
+                            "Overlay-only buffer pts=%s end_pts=%s gst_pts=%s frame_count=%s",
+                            buffer_pts,
+                            self._frame_selector._chunk.end_pts if self._frame_selector._chunk else None,
+                            buffer.pts,
+                            self._overlay_frame_count,
+                        )
+                        self._overlay_debug_count += 1
+                    def _force_overlay_eos(reason: str):
+                        self._pipeline.send_event(Gst.Event.new_eos())
+                        if self._audio_convert:
+                            self._audio_convert.send_event(Gst.Event.new_eos())
+                        self._eos_sent = True
+                        self._overlay_eos_requested = True
+                        # Fallback to ensure the loop exits even if EOS isn't propagated.
+                        def _quit_if_no_eos():
+                            try:
+                                if self._overlay_eos_requested and not self._overlay_eos_received:
+                                    logger.warning(
+                                        "Overlay-only EOS fallback: quitting loop after timeout."
+                                    )
+                                    if self._loop:
+                                        self._audio_stop.set()
+                                        self._loop.quit()
+                            except Exception:
+                                pass
+                            return False
+
+                        try:
+                            GLib.timeout_add(2000, _quit_if_no_eos)
+                        except Exception:
+                            _quit_if_no_eos()
+                    if (
+                        self._frame_selector._chunk
+                        and self._frame_selector._chunk.end_pts > 0
+                        and buffer_pts >= self._frame_selector._chunk.end_pts
+                        and not self._eos_sent
+                    ):
+                        logger.info(
+                            "Overlay-only EOS by pts: %s >= %s",
+                            buffer_pts,
+                            self._frame_selector._chunk.end_pts,
+                        )
+                        _force_overlay_eos("pts")
+                    if (
+                        self._overlay_expected_frames
+                        and self._overlay_frame_count >= self._overlay_expected_frames
+                        and not self._eos_sent
+                    ):
+                        logger.info(
+                            "Overlay-only EOS by frame count: %s >= %s",
+                            self._overlay_frame_count,
+                            self._overlay_expected_frames,
+                        )
+                        _force_overlay_eos("frame_count")
+                    # Safety: wall-clock timeout to avoid stuck PTS for overlay-only.
+                    if (
+                        self._frame_selector._chunk
+                        and self._frame_selector._chunk.end_pts > 0
+                        and self._overlay_start_wallclock is not None
+                        and not self._eos_sent
+                    ):
+                        duration_sec = self._frame_selector._chunk.end_pts / 1e9
+                        if time.time() - self._overlay_start_wallclock > (duration_sec + 2.0):
+                            logger.info(
+                                "Overlay-only EOS by wallclock: elapsed=%.2fs duration=%.2fs",
+                                time.time() - self._overlay_start_wallclock,
+                                duration_sec,
+                            )
+                            _force_overlay_eos("wallclock")
+                    return Gst.PadProbeReturn.OK
                 if self._frame_selector.choose_frame(buffer, buffer_pts):
                     # print(f"Chosen frame buffer.pts = {buffer.pts}")
                     return Gst.PadProbeReturn.OK
@@ -2563,6 +2744,8 @@ class VideoFileFrameGetter:
 
         def add_to_cache(buffer, width, height):
             # Probe callback to add raw frame / jpeg image to cache
+            if self._overlay_only:
+                return
             _, mapinfo = buffer.map(Gst.MapFlags.READ)
             if self._enable_jpeg_output:
                 # Buffer contains JPEG image, add to cache as is
@@ -2605,6 +2788,9 @@ class VideoFileFrameGetter:
 
         def on_new_sample(appsink):
             # Appsink callback to pull frame from the pipeline
+            if self._overlay_only:
+                appsink.emit("pull-sample")
+                return Gst.FlowReturn.OK
             sample = appsink.emit("pull-sample")
             caps = sample.get_caps()
             height = caps.get_structure(0).get_value("height")
@@ -3085,7 +3271,68 @@ class VideoFileFrameGetter:
         else:
             capsfilter.link(q2)
 
-        q2.link(appsink)
+        if self._direct_overlay_video:
+            # Directly write overlay video from pipeline to avoid stutter from cached frames.
+            overlay_path = f"/tmp/via/cached_frames/{request_id}/{request_id}.mp4"
+            os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
+
+            tee_enc = Gst.ElementFactory.make("tee")
+            pipeline.add(tee_enc)
+
+            q_enc = Gst.ElementFactory.make("queue")
+            pipeline.add(q_enc)
+
+            enc_convert = Gst.ElementFactory.make("nvvideoconvert")
+            enc_convert.set_property("compute-hw", 1)
+            # Convert to system memory for x264enc.
+            enc_convert.set_property("nvbuf-memory-type", 0)
+            pipeline.add(enc_convert)
+
+            enc_capsfilter = Gst.ElementFactory.make("capsfilter")
+            enc_capsfilter.set_property(
+                "caps",
+                Gst.Caps.from_string("video/x-raw, format=I420"),
+            )
+            pipeline.add(enc_capsfilter)
+
+            x264enc = Gst.ElementFactory.make("x264enc")
+            x264enc.set_property("speed-preset", "veryfast")
+            x264enc.set_property("tune", "zerolatency")
+            x264enc.set_property("key-int-max", 30)
+            x264enc.set_property("bframes", 0)
+            pipeline.add(x264enc)
+
+            h264parse = Gst.ElementFactory.make("h264parse")
+            pipeline.add(h264parse)
+
+            mp4mux = Gst.ElementFactory.make("qtmux")
+            pipeline.add(mp4mux)
+
+            filesink = Gst.ElementFactory.make("filesink")
+            filesink.set_property("location", overlay_path)
+            filesink.set_property("async", False)
+            filesink.set_property("sync", False)
+            pipeline.add(filesink)
+
+            capsfilter.link(tee_enc)
+
+            tee_appsink_pad = tee_enc.get_request_pad("src_%u")
+            q2_sink_pad = q2.get_static_pad("sink")
+            tee_appsink_pad.link(q2_sink_pad)
+            q2.link(appsink)
+
+            tee_enc_pad = tee_enc.get_request_pad("src_%u")
+            q_enc_sink_pad = q_enc.get_static_pad("sink")
+            tee_enc_pad.link(q_enc_sink_pad)
+
+            q_enc.link(enc_convert)
+            enc_convert.link(enc_capsfilter)
+            enc_capsfilter.link(x264enc)
+            x264enc.link(h264parse)
+            h264parse.link(mp4mux)
+            mp4mux.link(filesink)
+        else:
+            q2.link(appsink)
 
         self._loop = GLib.MainLoop()
         bus = pipeline.get_bus()
@@ -3125,6 +3372,93 @@ class VideoFileFrameGetter:
             self._pipeline = None
         if self._gdino:
             self._gdino = None
+
+    def render_overlay_video(self, file: str, cv_metadata_json_file: str, request_id: str):
+        """Render a full-length CV overlay video without caching frames."""
+        if not cv_metadata_json_file:
+            return
+        from chunk_info import ChunkInfo
+
+        chunk = ChunkInfo()
+        chunk.file = file
+        chunk.chunkIdx = 0
+        chunk.start_pts = 0
+        try:
+            chunk.end_pts = MediaFileInfo.get_info(file).video_duration_nsec
+        except Exception:
+            chunk.end_pts = -1
+        chunk.cv_metadata_json_file = cv_metadata_json_file
+
+        prev_selector = self._frame_selector
+        prev_overlay_only = self._overlay_only
+        self._overlay_only = True
+        try:
+            self.get_frames(
+                chunk,
+                True,
+                frame_selector=AllFrameSelector(),
+                enable_audio=False,
+                request_id=request_id,
+            )
+        finally:
+            self._overlay_only = prev_overlay_only
+            self._frame_selector = prev_selector
+
+    def render_overlay_video_frames(self, file: str, cv_metadata_json_file: str, request_id: str):
+        """Render overlay by dumping frames to disk (JPEG) for ffmpeg fallback."""
+        if not cv_metadata_json_file:
+            return
+        from chunk_info import ChunkInfo
+
+        chunk = ChunkInfo()
+        chunk.file = file
+        chunk.chunkIdx = 0
+        chunk.start_pts = 0
+        try:
+            chunk.end_pts = MediaFileInfo.get_info(file).video_duration_nsec
+        except Exception:
+            chunk.end_pts = -1
+        chunk.cv_metadata_json_file = cv_metadata_json_file
+
+        prev_selector = self._frame_selector
+        prev_overlay_only = self._overlay_only
+        prev_dump_only = self._overlay_dump_frames_only
+        prev_enable_jpeg_output = self._enable_jpeg_output
+        prev_do_preprocess = self._do_preprocess
+        prev_force_dump = self._force_dump_frames_only
+        self._overlay_only = False
+        self._overlay_dump_frames_only = True
+        self._force_dump_frames_only = True
+        self._enable_jpeg_output = True
+        self._do_preprocess = False
+        try:
+            self.get_frames(
+                chunk,
+                True,
+                frame_selector=AllFrameSelector(),
+                enable_audio=False,
+                request_id=request_id,
+            )
+            try:
+                jpgs = [
+                    f
+                    for f in os.listdir(f"/tmp/via/cached_frames/{request_id}")
+                    if f.endswith(".jpg")
+                ]
+                logger.info(
+                    "Overlay frame dump complete for %s: %d jpgs",
+                    request_id,
+                    len(jpgs),
+                )
+            except Exception:
+                pass
+        finally:
+            self._overlay_only = prev_overlay_only
+            self._overlay_dump_frames_only = prev_dump_only
+            self._force_dump_frames_only = prev_force_dump
+            self._enable_jpeg_output = prev_enable_jpeg_output
+            self._do_preprocess = prev_do_preprocess
+            self._frame_selector = prev_selector
 
     # Debug functionality
     # Dump cached frames
@@ -3307,7 +3641,12 @@ class VideoFileFrameGetter:
             self._last_video_codec = video_codec
 
             if not self._pipeline:
-                if chunk.cv_metadata_json_file:
+                use_osd_pipeline = bool(chunk.cv_metadata_json_file) and (
+                    self._overlay_only
+                    or self._use_osd_pipeline_for_vlm
+                    or self._force_dump_frames_only
+                )
+                if use_osd_pipeline:
                     self._pipeline = self._create_osd_pipeline(
                         file,
                         cv_metadata_json_file=chunk.cv_metadata_json_file,
@@ -3317,6 +3656,29 @@ class VideoFileFrameGetter:
                 else:
                     self._pipeline = self._create_pipeline(file)
             pipeline = self._pipeline
+
+            if self._overlay_only:
+                try:
+                    fps = MediaFileInfo.get_info(file).video_fps or 0.0
+                except Exception:
+                    fps = 0.0
+                try:
+                    fps = float(fps)
+                except (TypeError, ValueError):
+                    fps = 0.0
+                if fps and fps > 0.0:
+                    self._overlay_frame_duration_ns = int(1e9 / fps)
+                    self._overlay_expected_frames = int((chunk.end_pts / 1e9) * fps)
+                    logger.info(
+                        "Overlay-only: fps=%.3f expected_frames=%d duration_ns=%d",
+                        fps,
+                        self._overlay_expected_frames,
+                        chunk.end_pts,
+                    )
+                else:
+                    self._overlay_frame_duration_ns = None
+                    self._overlay_expected_frames = None
+                self._overlay_frame_count = 0
 
             # Set start/end time in the file based on chunk info.
             frame_selector_backup = self._frame_selector
@@ -3328,11 +3690,18 @@ class VideoFileFrameGetter:
             pipeline.set_state(Gst.State.PAUSED)
             pipeline.get_state(Gst.CLOCK_TIME_NONE)
 
-            pipeline.seek_simple(
-                Gst.Format.TIME,
-                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.SNAP_BEFORE,
-                start_pts,
-            )
+            try:
+                seek_ok, _, is_seekable, _, _ = pipeline.query_seeking(Gst.Format.TIME)
+            except Exception:
+                seek_ok, is_seekable = False, False
+            if seek_ok and is_seekable:
+                pipeline.seek_simple(
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.SNAP_BEFORE,
+                    start_pts,
+                )
+            else:
+                logger.warning("Pipeline not seekable; processing without seek for chunk %d", chunk.chunkIdx)
 
             # Set the pipeline to PLAYING and wait for end-of-stream or error
             pipeline.set_state(Gst.State.PLAYING)
@@ -3348,6 +3717,22 @@ class VideoFileFrameGetter:
             self._pipeline.set_state(Gst.State.NULL)
             self._pipeline = None
             self._clear_pipeline_elements()
+
+        # Overlay-only path doesn't need cached frames or preprocessing.
+        if self._overlay_only:
+            if not retain_pipeline or has_error:
+                self._pipeline.set_state(Gst.State.NULL)
+                self._pipeline = None
+                self._clear_pipeline_elements()
+            self._overlay_only = False
+            self._overlay_start_wallclock = None
+            self._overlay_frame_count = 0
+            self._overlay_frame_duration_ns = None
+            self._overlay_expected_frames = None
+            self._overlay_eos_requested = False
+            self._overlay_eos_received = False
+            self._force_dump_frames_only = False
+            return ([], [], [], self._err_msg)
 
         # Return the cached raw preprocessed frames / jpegs and the corresponding timestamps.
         # Adjust for the PTS offset if any.
@@ -3365,6 +3750,13 @@ class VideoFileFrameGetter:
         self.dump_cached_frame(
             self._cached_frames, self._cached_frames_pts, self._enable_jpeg_output
         )
+
+        if self._overlay_dump_frames_only:
+            # Skip preprocessing and return early after dumping frames.
+            self._cached_frames = None
+            with self._err_msg_lock:
+                err_msg = self._err_msg
+            return ([], [], [], err_msg)
 
         logger.debug(
             "sampled frame num: %d, chunk: %s, gpu_id: %d",

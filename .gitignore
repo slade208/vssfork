@@ -1,0 +1,14 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python caches
+**/__pycache__/
+
+# Local artifacts
+notes.mp4
+notes.mkv
+
+# Local backups
+.env.original

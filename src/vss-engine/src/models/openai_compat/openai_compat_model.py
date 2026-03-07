@@ -186,18 +186,30 @@ class CompOpenAIModel:
             )
         else:
             self.configure_openai()
+        self._use_max_completion_tokens = self._should_use_max_completion_tokens()
 
     def __init__(self, test_api_call=False) -> None:
         self._model_name = None
         self._model = None
         self._client = None
         self._endpoint = ""
+        self._use_max_completion_tokens = False
         self.init_gpt_4()
         # Overwrite environment with final selected endpoint
         logger.info(f"endpoint is {self._endpoint}")
         os.environ["VIA_VLM_ENDPOINT"] = self._endpoint
         if test_api_call:
             self.generate("", [[]], [[]], None, None)
+
+    def _should_use_max_completion_tokens(self) -> bool:
+        """Use max_completion_tokens for models that don't accept max_tokens."""
+        env_flag = os.environ.get("OPENAI_USE_MAX_COMPLETION_TOKENS", "").lower()
+        if env_flag in ("1", "true", "yes"):
+            return True
+        if not self._model_name:
+            return False
+        model_name = self._model_name.lower()
+        return model_name.startswith("gpt-5") or model_name.startswith("o")
 
     @property
     def model_name(self):
@@ -350,10 +362,15 @@ class CompOpenAIModel:
                         )
                         content = response_obj.content
                     elif self._client:
+                        token_kwargs = (
+                            {"max_completion_tokens": generation_config["max_new_tokens"]}
+                            if self._use_max_completion_tokens
+                            else {"max_tokens": generation_config["max_new_tokens"]}
+                        )
                         resp = self._client.chat.completions.create(
                             model=self._model_name,
                             messages=messages,
-                            max_tokens=generation_config["max_new_tokens"],
+                            **token_kwargs,
                             temperature=generation_config["temperature"],
                             seed=seed,
                             top_p=generation_config["top_p"],

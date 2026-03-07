@@ -487,8 +487,10 @@ class JsonCVMetadata:
 
 
 def get_json_file_name(request_id, chunk_idx):
-    filename = str(request_id) + "_" + str(chunk_idx) + ".json"
-    return filename
+    base_dir = "/tmp/via/cv_metadata"
+    os.makedirs(base_dir, exist_ok=True)
+    filename = f"{request_id}_{chunk_idx}.json"
+    return os.path.join(base_dir, filename)
 
 
 def process_highlight_request(messages):

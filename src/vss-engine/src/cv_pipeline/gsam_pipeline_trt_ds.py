@@ -390,17 +390,25 @@ class GSAMPipeline:
         nvstreammux.set_property("gpu-id", self._gpu_id)
         nvstreammux.set_property("buffer-pool-size", self._buffer_pool_size)
 
-        # videoconvert = Gst.ElementFactory.make("nvvideoconvert")
-        # videoconvert.set_property("nvbuf-memory-type", 2)
-        # videoconvert.set_property("gpu-id", self._gpu_id)
-        # videoconvert.set_property("interpolation-method", 1)
-        # pipeline.add(videoconvert)
+        # Convert decoder output to NVMM buffers before nvstreammux.
+        pre_nvvideoconvert = Gst.ElementFactory.make("nvvideoconvert")
+        pre_nvvideoconvert.set_property("nvbuf-memory-type", 2)
+        pre_nvvideoconvert.set_property("gpu-id", self._gpu_id)
+        pre_nvvideoconvert.set_property("interpolation-method", 1)
+        pipeline.add(pre_nvvideoconvert)
         queue = Gst.ElementFactory.make("queue")
         pipeline.add(queue)
 
         # Add a tee, queue and fakesink reuired for seeking
         # decoder -> tee -> queue -> fakesink
         #        |-> queue nvstreammux
+        pre_capsfilter = Gst.ElementFactory.make("capsfilter")
+        pre_capsfilter.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"),
+        )
+        pipeline.add(pre_capsfilter)
+
         tee = Gst.ElementFactory.make("tee")
         pipeline.add(tee)
         tee_pad = tee.get_static_pad("sink")
@@ -425,12 +433,6 @@ class GSAMPipeline:
         seek_fakesink.set_property("sync", False)
         pipeline.add(seek_fakesink)
 
-        capsfilter = Gst.ElementFactory.make("capsfilter")
-        capsfilter.set_property(
-            "caps",
-            Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"),
-        )
-        pipeline.add(capsfilter)
         unique_filename = f"/tmp/config_nvinferserver_{uuid.uuid4()}.txt"
         self._unique_filename = unique_filename
 
@@ -439,21 +441,21 @@ class GSAMPipeline:
             "/opt/nvidia/TritonGdino/config_triton_nvinferserver_gdino.txt", unique_filename
         )
 
-        # if not os.path.exists("/tmp/nvdsinferserver_custom_impl_gdino/"):
         try:
             shutil.copytree(
                 "/opt/nvidia/TritonGdino/nvdsinferserver_custom_impl_gdino/",
                 "/tmp/nvdsinferserver_custom_impl_gdino/",
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore_dangling_symlinks=True,
+                copy_function=shutil.copy2,
             )
         except Exception as e:
             print(f"Error copying nvdsinferserver_custom_impl_gdino: {e}")
-        # else:
-        #    print("nvdsinferserver_custom_impl_gdino already exists in /tmp")
 
-        # if not os.path.exists(f"/tmp/TritonGdino_{self._gpu_id}/"):
+        # Ensure TritonGdino assets exist in /tmp, then verify required files.
         if not self._check_required_files(f"/tmp/TritonGdino_{self._gpu_id}/"):
             try:
-                # os.makedirs(f"/tmp/TritonGdino_{self._gpu_id}/", exist_ok=True)
                 shutil.copytree(
                     "/opt/nvidia/TritonGdino/",
                     f"/tmp/TritonGdino_{self._gpu_id}/",
@@ -464,6 +466,8 @@ class GSAMPipeline:
                 )
             except Exception as e:
                 print(f"Error copying TritonGdino: {e}")
+            # Re-check after copy to avoid false missing-file warnings.
+            self._check_required_files(f"/tmp/TritonGdino_{self._gpu_id}/")
 
         if self._gpu_id != 0:
             try:
@@ -646,16 +650,25 @@ class GSAMPipeline:
         nvtrackersrcpad = nvtracker.get_static_pad("src")
         nvtrackersrcpad.add_probe(Gst.PadProbeType.BUFFER, tracker_src_pad_buffer_probe, self)
 
-        def cb_newpad(nvurisrcbin, nvurisrcbin_pad, data_dict, tee):
+        def cb_newpad(nvurisrcbin, nvurisrcbin_pad, data_dict, pre_nvvideoconvert):
             print("Decode callback")
-            sinkpad = tee.get_compatible_pad(nvurisrcbin_pad, None)
+            try:
+                caps = nvurisrcbin_pad.get_current_caps() or nvurisrcbin_pad.query_caps(None)
+                caps_str = caps.to_string() if caps else ""
+            except Exception:
+                caps_str = ""
+            # Only link video pads; ignore audio/other pads to avoid negotiation errors.
+            if "video/" not in caps_str:
+                print(f"Ignoring non-video pad: {caps_str}")
+                return
+            sinkpad = pre_nvvideoconvert.get_static_pad("sink")
             if sinkpad is not None:
                 nvurisrcbin_pad.link(sinkpad)
             else:
                 print("No compatible pad found to link nvurisrcbin_pad")
 
         data_dict = {}
-        nvurisrcbin.connect("pad-added", cb_newpad, data_dict, tee)
+        nvurisrcbin.connect("pad-added", cb_newpad, data_dict, pre_nvvideoconvert)
 
         def cb_elem_added(elem, username, password):
             if "nvv4l2decoder" in elem.get_factory().get_name():
@@ -673,6 +686,9 @@ class GSAMPipeline:
             ),
         )
 
+        pre_nvvideoconvert.link(pre_capsfilter)
+        pre_capsfilter.link(tee)
+
         tee.link(queue_tee_streammux)
         queue_tee_streammux_src_pad = queue_tee_streammux.get_static_pad("src")
         mux_sinkpad = nvstreammux.request_pad_simple("sink_0")
@@ -683,9 +699,6 @@ class GSAMPipeline:
 
         nvstreammux.link(queue)
         queue.link(nvdsinferserver)
-        # queue.link(videoconvert)
-        # videoconvert.link(capsfilter)
-        # capsfilter.link(nvdsinferserver)
         nvdsinferserver.link(queue2)
         # queue2.link(nvvideoconvert2)
         # nvvideoconvert2.link(queue3)

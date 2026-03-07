@@ -125,7 +125,7 @@ class GroundingProcess(ViaProcessBase):
             inference_interval=self._inference_interval,
             request_id=kwargs["request_id"],
             # gpu_id=self._gpu_id,
-            batch_size=4,
+            batch_size=1,
             buffer_pool_size=20,
         )
         pts_to_frame_num_map, max_object_id = gsam_pipeline.start()
