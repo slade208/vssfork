@@ -1,0 +1,6 @@
+aws_region      = "us-west-1"
+subnet_id       = "subnet-xxxxxxxx"
+vpc_id          = "vpc-xxxxxxxx"
+instance_type   = "g4dn.xlarge"
+ssh_username    = "ubuntu"
+ami_name_prefix = "vss-gpu-demo"
